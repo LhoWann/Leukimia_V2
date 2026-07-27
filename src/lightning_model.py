@@ -2,8 +2,11 @@ import warnings
 warnings.filterwarnings("ignore", message="triton not found.*", module="torch.utils.flop_counter")
 warnings.filterwarnings("ignore", category=UserWarning, module="torch.nn.functional")
 
+import os
 import random
 from typing import Dict, List, Optional
+
+from PIL import Image
 
 import lightning as L
 import numpy as np
@@ -12,6 +15,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
 from torchmetrics import Accuracy, F1Score, Precision, Recall
 
 
@@ -83,8 +87,6 @@ class ConvNeXtV2Classifier(nn.Module):
         feat = self.forward_features(x)
         pooled = self.pool(feat).flatten(1)
         return self.classifier(self.head_dropout(pooled))
-
-
 
 
 class GradCAMExtractor:
@@ -180,7 +182,7 @@ class LeukemiaLightningModel(L.LightningModule):
         label_smoothing: float = 0.0,
         class_weights: Optional[List[float]] = None,
         use_focal_loss: bool = True,
-        focal_gamma: float = 2.0,
+        focal_gamma: float = 3.0,
         uda_mode: bool = False,
     ):
         super().__init__()
@@ -195,66 +197,112 @@ class LeukemiaLightningModel(L.LightningModule):
         )
 
         self.label_smoothing = label_smoothing
-        self.register_buffer(
-            'class_weight_tensor',
-            torch.tensor(class_weights, dtype=torch.float32)
-            if class_weights is not None else None,
-        )
+        if class_weights is not None:
+            self.register_buffer(
+                'class_weight_tensor',
+                torch.tensor(class_weights, dtype=torch.float32),
+            )
+        else:
+            self.class_weight_tensor = None
 
         self.val_acc = Accuracy(task='multiclass', num_classes=num_classes)
         self.val_f1 = F1Score(task='multiclass', num_classes=num_classes, average='macro')
         self.val_prec = Precision(task='multiclass', num_classes=num_classes, average='macro')
         self.val_rec = Recall(task='multiclass', num_classes=num_classes, average='macro')
 
+    BURNIN_EPOCHS = 20
+    MIN_SOURCE_F1_FOR_PSEUDOLABEL = 0.70
+
     def on_train_epoch_start(self):
-        # Iterative Pseudo-Labeling Phase
-        if not self.hparams.uda_mode or self.current_epoch < 5:
+        if not self.hparams.uda_mode:
+            return
+
+        if self.current_epoch < self.BURNIN_EPOCHS:
+            print(f"[UDA] Epoch {self.current_epoch}: burn-in ({self.current_epoch}/{self.BURNIN_EPOCHS}), skipping pseudo-label.")
+            return
+
+        source_f1 = self.trainer.callback_metrics.get('val_f1', torch.tensor(0.0))
+        if isinstance(source_f1, torch.Tensor):
+            source_f1 = source_f1.item()
+        if source_f1 < self.MIN_SOURCE_F1_FOR_PSEUDOLABEL:
+            print(f"[UDA] Epoch {self.current_epoch}: val_f1={source_f1:.4f} < {self.MIN_SOURCE_F1_FOR_PSEUDOLABEL}, skipping pseudo-label.")
             return
 
         dm = self.trainer.datamodule
         if not dm.target_samples:
             return
-            
-        print(f"\n[UDA] Epoch {self.current_epoch}: Generating pseudo-labels for {len(dm.target_samples)} target samples...")
+
+        epoch = self.current_epoch
+        if epoch < 30:
+            conf_threshold = 0.95
+        elif epoch < 50:
+            conf_threshold = 0.90
+        else:
+            conf_threshold = 0.85
+
+        print(f"\n[UDA] Epoch {epoch}: Generating pseudo-labels "
+              f"(threshold={conf_threshold}, source_f1={source_f1:.4f}, "
+              f"{len(dm.target_samples)} target samples)...")
         self.model.eval()
-        pseudo_labels = {}
         all_candidates: List[tuple] = []
 
         device = self.device
         transform = dm.val_transform
 
-        conf_threshold = 0.90
+        class _TargetDS(Dataset):
+            def __init__(self_, samples, transform):
+                self_.samples = samples
+                self_.transform = transform
+
+            def __len__(self_):
+                return len(self_.samples)
+
+            def __getitem__(self_, idx):
+                path, _ = self_.samples[idx]
+                return self_.transform(Image.open(path).convert('RGB')), os.path.basename(path)
+
+        loader = DataLoader(
+            _TargetDS(dm.target_samples, transform),
+            batch_size=32,
+            shuffle=False,
+            num_workers=0,
+            pin_memory=False,
+        )
 
         with torch.inference_mode():
-            for path, _ in dm.target_samples:
-                from PIL import Image
-                img_pil = Image.open(path).convert('RGB')
-                x = transform(img_pil).unsqueeze(0).to(device)
-
-                logits = self(x)
-                probs = torch.softmax(logits, dim=1)[0]
-                max_prob, pred_cls = torch.max(probs, dim=0)
-
-                if max_prob.item() > conf_threshold:
-                    from os.path import basename
-                    all_candidates.append((basename(path), pred_cls.item()))
+            for imgs, fnames in loader:
+                imgs = imgs.to(device)
+                logits = self(imgs)
+                probs = torch.softmax(logits, dim=1)
+                max_probs, pred_cls = torch.max(probs, dim=1)
+                for fname, prob, cls in zip(fnames, max_probs.tolist(), pred_cls.tolist()):
+                    if prob > conf_threshold:
+                        all_candidates.append((fname, cls))
 
         class_buckets: Dict[int, List[str]] = {}
         for fname, cls in all_candidates:
             class_buckets.setdefault(cls, []).append(fname)
 
+        pseudo_labels: Dict[str, int] = {}
         if class_buckets:
+            if len(class_buckets) < 2:
+                only_cls = list(class_buckets.keys())[0]
+                print(f"[UDA] WARNING: All pseudo-labels are class {only_cls} only. "
+                      f"Skipping injection to prevent bias reinforcement.")
+                self.model.train()
+                dm.update_pseudo_labels({})
+                return
             min_count = min(len(v) for v in class_buckets.values())
             max_allowed = max(min_count * 4, 1)
             for cls, fnames in class_buckets.items():
                 for fname in fnames[:max_allowed]:
                     pseudo_labels[fname] = cls
+        else:
+            max_allowed = 0
 
         self.model.train()
-        total_candidates = len(all_candidates)
-        max_allowed = max(min(len(v) for v in class_buckets.values()) * 4, 1) if class_buckets else 0
         print(f"[UDA] Kept {len(pseudo_labels)}/{len(dm.target_samples)} pseudo-labels "
-              f"(>{conf_threshold} threshold, {total_candidates} passed, balanced cap={max_allowed}).")
+              f"({len(all_candidates)} passed threshold, balanced cap={max_allowed}).")
 
         dm.update_pseudo_labels(pseudo_labels)
 

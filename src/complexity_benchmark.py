@@ -64,7 +64,7 @@ def bench(name, model, device, iters):
         gflops = flops / 1e9
     except Exception as e:
         gflops = float('nan')
-        print(f'  [warn] FLOP count gagal untuk {name}: {e}')
+        print(f'  [warn] FLOP count failed for {name}: {e}')
     b1_batch, b1_img = measure_latency(model, device, 1, iters)
     b32_batch, b32_img = measure_latency(model, device, 32, max(5, iters // 4))
     return {
@@ -107,18 +107,18 @@ def main():
         if device.type == 'cuda':
             torch.cuda.empty_cache()
 
-    L = ['# Kompleksitas Model & Latensi', '',
-         f'Input 224x224, FP32, device **{dev_name}**. Latensi = warmup 10 + rata-rata '
-         f'{args.iters} iterasi (batch=1) / {max(5, args.iters // 4)} iterasi (batch=32), CUDA-synced. '
-         'Bobot acak (tidak memengaruhi params/FLOPs/latensi).', '',
-         '| Model | Params (M) | FLOPs (G) | GMACs | Latensi b1 (ms/img) | Latensi b32 (ms/img) | Throughput b32 (img/s) |',
+    L = ['# Model Complexity & Latency', '',
+         f'Input 224x224, FP32, device **{dev_name}**. Latency = 10 warmup + average '
+         f'{args.iters} iterations (batch=1) / {max(5, args.iters // 4)} iterations (batch=32), CUDA-synced. '
+         'Random weights (does not affect params/FLOPs/latency).', '',
+         '| Model | Params (M) | FLOPs (G) | GMACs | Latency b1 (ms/img) | Latency b32 (ms/img) | Throughput b32 (img/s) |',
          '| ----- | :--------: | :-------: | :---: | :-----------------: | :------------------: | :--------------------: |']
     for r in rows:
         L.append(f"| {r['name']} | {r['params_m']:.1f} | {r['gflops']:.2f} | {r['gmacs']:.2f} "
                  f"| {r['lat_b1_img_ms']:.2f} | {r['lat_b32_img_ms']:.2f} | {r['throughput_b32']:.0f} |")
     L += ['', '> FLOPs via `torch.utils.flop_counter.FlopCounterMode` (total_flops = MACs). '
-          'GMACs = FLOPs/2. Latensi spesifik-hardware; pakai untuk perbandingan relatif antar-model '
-          'pada perangkat sama, bukan angka absolut universal.']
+          'GMACs = FLOPs/2. Latency is hardware-specific; use for relative comparison between models '
+          'on the same hardware, not as an absolute universal number.']
 
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)

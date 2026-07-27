@@ -274,7 +274,9 @@ class LeukemiaDataModule(L.LightningDataModule):
         self.stain_sigma_std  = stain_sigma_std
         self.stain_aug_prob   = stain_aug_prob
         self.use_dataset_weighted_sampling = use_dataset_weighted_sampling
-        self.manifest_csv     = manifest_csv or os.path.join(data_dir, 'metadata', 'dataset_manifest.csv')
+        raw_manifest = manifest_csv or os.path.join(data_dir, 'metadata', 'dataset_manifest.csv')
+        self.manifest_csv = str(Path(raw_manifest).resolve())
+        self._dataset_sample_weights = None
         self.save_hyperparameters()
 
         if use_robust_aug:
@@ -392,7 +394,7 @@ class LeukemiaDataModule(L.LightningDataModule):
             classes=self.classes,
             class_to_idx=self._class_to_idx,
             transform=self.train_transform,
-            aug_mode=self.aug_mode.replace('uda_', ''),
+            aug_mode=self.aug_mode,
             aug_prob=self.aug_prob,
             n_segments=self.n_segments,
             compactness=self.compactness,
@@ -424,7 +426,6 @@ class LeukemiaDataModule(L.LightningDataModule):
                 collate_fn=focusaugmix_collate_fn,
                 pin_memory=False,
                 persistent_workers=(n_workers > 0),
-                drop_last=False,
             )
 
         return DataLoader(
@@ -435,16 +436,16 @@ class LeukemiaDataModule(L.LightningDataModule):
             collate_fn=focusaugmix_collate_fn,
             pin_memory=False,
             persistent_workers=(n_workers > 0),
-            drop_last=False,
         )
 
     def val_dataloader(self):
+        _pin = torch.cuda.is_available()
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            pin_memory=True,
+            pin_memory=_pin,
             persistent_workers=self.num_workers > 0,
         )
 
@@ -462,17 +463,18 @@ class LeukemiaDataModule(L.LightningDataModule):
         test_path = os.path.abspath(test_dir)
 
         class _ExternalDataset(Dataset):
-            def __init__(self_, root, cls_map, transform, normalizer_):
+            def __init__(self_, root, cls_map, class_to_idx, transform, normalizer_):
                 exts = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff'}
                 self_.samples: List[Tuple[str, int]] = []
                 self_.transform    = transform
                 self_.normalizer   = normalizer_
+                self_.class_to_idx = class_to_idx
                 for subdir in sorted(os.listdir(root)):
                     full_subdir = os.path.join(root, subdir)
                     if not os.path.isdir(full_subdir):
                         continue
                     canonical = cls_map.get(subdir, subdir)
-                    label     = self.class_to_idx.get(canonical)
+                    label     = self_.class_to_idx.get(canonical)
                     if label is None:
                         continue
                     for fname in sorted(os.listdir(full_subdir)):
@@ -498,10 +500,11 @@ class LeukemiaDataModule(L.LightningDataModule):
 
         cls_map = {**CNMC_ALIAS}
         dataset = _ExternalDataset(
-            root        = test_path,
-            cls_map     = cls_map,
-            transform   = self.val_transform,
-            normalizer_ = normalizer,
+            root         = test_path,
+            cls_map      = cls_map,
+            class_to_idx = self._class_to_idx,
+            transform    = self.val_transform,
+            normalizer_  = normalizer,
         )
 
         n_workers = num_workers if num_workers is not None else (

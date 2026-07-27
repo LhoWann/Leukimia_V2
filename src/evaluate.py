@@ -26,6 +26,7 @@ from sklearn.metrics import (
     precision_score,
     recall_score,
     roc_auc_score,
+    roc_curve,
 )
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
@@ -139,15 +140,32 @@ def compute_metrics(
     except ValueError:
         auc = float('nan')
 
+    try:
+        fpr, tpr, thresholds = roc_curve(y_true, y_prob)
+        j_scores = tpr - fpr
+        best_idx = int(np.argmax(j_scores))
+        optimal_threshold = float(thresholds[best_idx])
+        optimal_sensitivity = float(tpr[best_idx])
+        optimal_specificity = float(1 - fpr[best_idx])
+    except Exception:
+        optimal_threshold = float('nan')
+        optimal_sensitivity = float('nan')
+        optimal_specificity = float('nan')
+
     return {
         'accuracy': accuracy_score(y_true, y_pred),
         'f1_macro': f1_score(y_true, y_pred, average='macro', zero_division=0),
-        'f1_binary': f1_score(y_true, y_pred, average='binary', zero_division=0),
+        'f1_binary': f1_score(y_true, y_pred, pos_label=1, average='binary', zero_division=0),
         'precision_macro': precision_score(y_true, y_pred, average='macro', zero_division=0),
         'recall_macro': recall_score(y_true, y_pred, average='macro', zero_division=0),
         'sensitivity': recall_score(y_true, y_pred, pos_label=1, average='binary', zero_division=0),
         'specificity': specificity,
+        'balanced_accuracy': (recall_score(y_true, y_pred, pos_label=1, average='binary', zero_division=0) + specificity) / 2,
         'auc_roc': auc,
+        'optimal_threshold': optimal_threshold,
+        'optimal_sensitivity': optimal_sensitivity,
+        'optimal_specificity': optimal_specificity,
+        'optimal_balanced_acc': (optimal_sensitivity + optimal_specificity) / 2 if not (np.isnan(optimal_sensitivity) or np.isnan(optimal_specificity)) else float('nan'),
         'tp': int(tp),
         'tn': int(tn),
         'fp': int(fp),
@@ -184,23 +202,37 @@ def subtype_breakdown(
     return breakdown
 
 
-def format_metrics_table(name: str, metrics: Dict[str, float]) -> str:
+def format_metrics_table(name: str, metrics: Dict[str, float], threshold: float = 0.5) -> str:
     lines = [
         f"Experiment : {name}",
-        f"{'Metric':<22} {'Value':>10}",
-        '-' * 34,
-        f"{'Accuracy':<22} {metrics['accuracy']:>10.4f}",
-        f"{'F1 (macro)':<22} {metrics['f1_macro']:>10.4f}",
-        f"{'F1 (binary ALL)':<22} {metrics['f1_binary']:>10.4f}",
-        f"{'Precision (macro)':<22} {metrics['precision_macro']:>10.4f}",
-        f"{'Recall (macro)':<22} {metrics['recall_macro']:>10.4f}",
-        f"{'Sensitivity (ALL)':<22} {metrics['sensitivity']:>10.4f}",
-        f"{'Specificity (Normal)':<22} {metrics['specificity']:>10.4f}",
-        f"{'AUC-ROC':<22} {metrics['auc_roc']:>10.4f}",
-        '-' * 34,
-        f"{'TP/TN/FP/FN':<22} {metrics['tp']}/{metrics['tn']}/{metrics['fp']}/{metrics['fn']}",
+        f"Threshold  : {threshold:.4f}",
+        f"{'Metric':<28} {'Value':>10}",
+        '-' * 40,
+        f"{'Accuracy':<28} {metrics['accuracy']:>10.4f}",
+        f"{'Balanced Accuracy':<28} {metrics['balanced_accuracy']:>10.4f}",
+        f"{'F1 (macro)':<28} {metrics['f1_macro']:>10.4f}",
+        f"{'F1 (binary ALL)':<28} {metrics['f1_binary']:>10.4f}",
+        f"{'Precision (macro)':<28} {metrics['precision_macro']:>10.4f}",
+        f"{'Recall (macro)':<28} {metrics['recall_macro']:>10.4f}",
+        f"{'Sensitivity (ALL)':<28} {metrics['sensitivity']:>10.4f}",
+        f"{'Specificity (Normal)':<28} {metrics['specificity']:>10.4f}",
+        f"{'AUC-ROC':<28} {metrics['auc_roc']:>10.4f}",
+        '-' * 40,
+        f"{'TP/TN/FP/FN':<28} {metrics['tp']}/{metrics['tn']}/{metrics['fp']}/{metrics['fn']}",
+        '-' * 40,
+        f"{'Optimal threshold (Youden J)':<28} {metrics['optimal_threshold']:>10.4f}",
+        f"{'Optimal Sensitivity':<28} {metrics['optimal_sensitivity']:>10.4f}",
+        f"{'Optimal Specificity':<28} {metrics['optimal_specificity']:>10.4f}",
+        f"{'Optimal Balanced Acc':<28} {metrics['optimal_balanced_acc']:>10.4f}",
     ]
     return '\n'.join(lines)
+
+
+def _val_f1_from_filename(path: Path) -> float:
+    try:
+        return float(path.stem.split('val_f1=')[-1])
+    except Exception:
+        return 0.0
 
 
 def find_best_checkpoint(exp_name: str, ckpt_root: str, seed: Optional[int]) -> Optional[str]:
@@ -212,11 +244,14 @@ def find_best_checkpoint(exp_name: str, ckpt_root: str, seed: Optional[int]) -> 
     for ckpt_dir in search_dirs:
         if not ckpt_dir.is_dir():
             continue
-        candidates = sorted(ckpt_dir.glob('*.ckpt'))
+        candidates = sorted(
+            [c for c in ckpt_dir.glob('*.ckpt') if c.name != 'last.ckpt'],
+            key=_val_f1_from_filename,
+            reverse=True,
+        )
+        if candidates:
+            return str(candidates[0])
         last = ckpt_dir / 'last.ckpt'
-        for c in candidates:
-            if c.name != 'last.ckpt':
-                return str(c)
         if last.exists():
             return str(last)
     return None
@@ -231,6 +266,7 @@ def evaluate_experiment(
     device: torch.device,
     batch_size: int,
     seed: Optional[int],
+    threshold: float = 0.5,
 ) -> Optional[Dict]:
     ckpt_path = find_best_checkpoint(exp_name, ckpt_root, seed)
     if ckpt_path is None:
@@ -251,11 +287,12 @@ def evaluate_experiment(
 
     print(f"Test samples: {len(dataset)}")
 
-    preds, probs, labels, names = run_inference(model, dataset, device, batch_size)
+    _, probs, labels, names = run_inference(model, dataset, device, batch_size)
+    preds = (probs >= threshold).astype(int)
     metrics = compute_metrics(labels, preds, probs)
 
     print()
-    print(format_metrics_table(exp_name, metrics))
+    print(format_metrics_table(exp_name, metrics, threshold))
 
     subtype_map = load_subtype_map(manifest_path)
     if subtype_map:
@@ -275,6 +312,7 @@ def evaluate_experiment(
         'checkpoint': ckpt_path,
         'test_dir': test_dir,
         'seed': seed,
+        'threshold': threshold,
         'n_samples': len(dataset),
         'metrics': {k: (v if not (isinstance(v, float) and np.isnan(v)) else None)
                     for k, v in metrics.items()},
@@ -302,7 +340,9 @@ def compare_experiments(results: List[Dict]) -> None:
     print(f"{'=' * 60}")
 
     metric_keys = [
-        'accuracy', 'f1_macro', 'f1_binary', 'sensitivity', 'specificity', 'auc_roc'
+        'accuracy', 'balanced_accuracy', 'f1_macro', 'f1_binary',
+        'sensitivity', 'specificity', 'auc_roc',
+        'optimal_threshold', 'optimal_sensitivity', 'optimal_specificity', 'optimal_balanced_acc',
     ]
     header = f"{'Metric':<22}" + ''.join(f"{r['experiment']:>18}" for r in results)
     print(header)
@@ -335,6 +375,9 @@ def main():
                         help='Specific seed to evaluate (None = auto-find)')
     parser.add_argument('--batch-size', type=int, default=32)
     parser.add_argument('--device', type=str, default='auto')
+    parser.add_argument('--threshold', type=float, default=0.5,
+                        help='Decision threshold for Abnormal class (default=0.5). '
+                             'Use Youden J optimal from a previous run or sweep manually.')
     args = parser.parse_args()
 
     if args.device == 'auto':
@@ -354,6 +397,7 @@ def main():
             device=device,
             batch_size=args.batch_size,
             seed=args.seed,
+            threshold=args.threshold,
         )
         if result is not None:
             all_results.append(result)

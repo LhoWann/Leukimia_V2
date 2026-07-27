@@ -1,0 +1,7 @@
+{
+  "entries": [
+    { "path": "vendor" },
+    { "path": "vendor/caveman/skills" },
+    { "path": "vendor/graphify" }
+  ]
+}

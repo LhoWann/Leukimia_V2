@@ -1,17 +1,16 @@
 __pycache__
 .venv
 
-# Model weights & training logs (besar/regenerable) — semua varian
 checkpoints*
 logs*
 
-# Dataset mentah & turunannya (tidak di-commit)
 data
 dataset
 raw_data
 
-# Hasil single-seed (regenerable); hasil multi-seed & perbandingan TETAP di-track
 result
 results
+graphify-out/
+vendor
 
 STRATEGI_PENELITIAN.md
