@@ -109,8 +109,8 @@ def run_inference(
         for images, labels, names in loader:
             images = images.to(device)
             logits = model(images)
-            probs = F.softmax(logits, dim=1)[:, 1]
-            preds = logits.argmax(dim=1)
+            probs = F.softmax(logits, dim=1)[:, 0]
+            preds = 1 - logits.argmax(dim=1)
 
             all_preds.extend(preds.cpu().numpy().tolist())
             all_probs.extend(probs.cpu().numpy().tolist())

@@ -369,6 +369,14 @@ def run_dual_pipeline(
 
         _release_gpu()
 
+        print(f"\n[Evaluation] Running evaluation for seed {seed}...")
+        subprocess.run([
+            sys.executable, "src/evaluate.py", 
+            "--exp", "source_only", "uda_pseudolabel", 
+            "--seed", str(seed)
+        ], check=True)
+        print(f"[Evaluation] Done for seed {seed}.\n")
+
 
 def main():
     parser = argparse.ArgumentParser(description='UDA Leukemia Training')

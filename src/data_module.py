@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import random
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -418,7 +419,7 @@ class LeukemiaDataModule(L.LightningDataModule):
                 num_samples=len(self._dataset_sample_weights),
                 replacement=True,
             )
-            return DataLoader(
+            source_loader = DataLoader(
                 self.train_dataset,
                 batch_size=self.batch_size,
                 sampler=sampler,
@@ -427,16 +428,38 @@ class LeukemiaDataModule(L.LightningDataModule):
                 pin_memory=False,
                 persistent_workers=(n_workers > 0),
             )
+        else:
+            source_loader = DataLoader(
+                self.train_dataset,
+                batch_size=self.batch_size,
+                shuffle=True,
+                num_workers=n_workers,
+                collate_fn=focusaugmix_collate_fn,
+                pin_memory=False,
+                persistent_workers=(n_workers > 0),
+            )
 
-        return DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=n_workers,
-            collate_fn=focusaugmix_collate_fn,
-            pin_memory=False,
-            persistent_workers=(n_workers > 0),
-        )
+        if self.uda_mode and len(self.target_samples) > 0:
+            class _TargetDS(Dataset):
+                def __init__(self_, samples, transform):
+                    self_.samples = samples
+                    self_.transform = transform
+                def __len__(self_): return len(self_.samples)
+                def __getitem__(self_, idx):
+                    return self_.transform(Image.open(self_.samples[idx][0]).convert('RGB'))
+
+            target_loader = DataLoader(
+                _TargetDS(self.target_samples, self.train_transform),
+                batch_size=self.batch_size,
+                shuffle=True,
+                num_workers=n_workers,
+                pin_memory=False,
+                persistent_workers=(n_workers > 0)
+            )
+            from lightning.pytorch.utilities.combined_loader import CombinedLoader
+            return CombinedLoader({"source": source_loader, "target": target_loader}, mode="max_size_cycle")
+
+        return source_loader
 
     def val_dataloader(self):
         _pin = torch.cuda.is_available()

@@ -19,6 +19,25 @@ from torch.utils.data import DataLoader, Dataset
 from torchmetrics import Accuracy, F1Score, Precision, Recall
 
 
+
+class GradientReversalFn(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, alpha):
+        ctx.alpha = alpha
+        return x.view_as(x)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        return grad_output.neg() * ctx.alpha, None
+
+class GradientReversalLayer(nn.Module):
+    def __init__(self, alpha=1.0):
+        super().__init__()
+        self.alpha = alpha
+
+    def forward(self, x):
+        return GradientReversalFn.apply(x, self.alpha)
+
 class ConvNeXtV2Classifier(nn.Module):
     STAGE_DIMS = [96, 192, 384, 768]
 
@@ -67,6 +86,13 @@ class ConvNeXtV2Classifier(nn.Module):
         self.pool = nn.AdaptiveAvgPool2d(1)
         self.head_dropout = nn.Dropout(head_dropout)
         self.classifier = nn.Linear(self.final_dim, num_classes)
+        self.domain_classifier = nn.Sequential(
+            GradientReversalLayer(alpha=1.0),
+            nn.Linear(self.final_dim, 256),
+            nn.ReLU(),
+            nn.Dropout(head_dropout),
+            nn.Linear(256, 2)
+        )
 
     def _apply_mha(self, x: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
@@ -83,10 +109,14 @@ class ConvNeXtV2Classifier(nn.Module):
                 x = self._apply_mha(x)
         return x
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_domain: bool = False) -> torch.Tensor:
         feat = self.forward_features(x)
         pooled = self.pool(feat).flatten(1)
-        return self.classifier(self.head_dropout(pooled))
+        cls_logits = self.classifier(self.head_dropout(pooled))
+        if return_domain:
+            domain_logits = self.domain_classifier(pooled)
+            return cls_logits, domain_logits
+        return cls_logits
 
 
 class GradCAMExtractor:
@@ -306,7 +336,9 @@ class LeukemiaLightningModel(L.LightningModule):
 
         dm.update_pseudo_labels(pseudo_labels)
 
-    def forward(self, x):
+    def forward(self, x, return_domain=False):
+        if return_domain:
+            return self.model(x, return_domain=True)
         return self.model(x)
 
     def _focal_weights(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -314,8 +346,33 @@ class LeukemiaLightningModel(L.LightningModule):
         return (1 - probs.gather(1, targets.unsqueeze(1)).squeeze(1)) ** self.hparams.focal_gamma
 
     def training_step(self, batch, batch_idx):
-        images, targets_a, targets_b, lam = batch
-        logits = self(images)
+        if isinstance(batch, dict) and "source" in batch:
+            source_batch = batch["source"]
+            target_images = batch.get("target")
+        else:
+            source_batch = batch
+            target_images = None
+            
+        images, targets_a, targets_b, lam = source_batch
+        
+        if target_images is not None:
+            B_s = images.size(0)
+            B_t = target_images.size(0)
+            combined_images = torch.cat([images, target_images], dim=0)
+            cls_logits, domain_logits = self(combined_images, return_domain=True)
+            
+            src_cls_logits = cls_logits[:B_s]
+            
+            domain_targets = torch.cat([
+                torch.zeros(B_s, dtype=torch.long, device=self.device),
+                torch.ones(B_t, dtype=torch.long, device=self.device)
+            ])
+            domain_loss = F.cross_entropy(domain_logits, domain_targets)
+            
+            logits = src_cls_logits
+        else:
+            logits = self(images)
+            domain_loss = 0.0
 
         ce_a = F.cross_entropy(logits, targets_a, weight=self.class_weight_tensor,
                                reduction='none', label_smoothing=self.label_smoothing)
@@ -325,12 +382,15 @@ class LeukemiaLightningModel(L.LightningModule):
         if self.hparams.use_focal_loss:
             fa = self._focal_weights(logits, targets_a)
             fb = self._focal_weights(logits, targets_b)
-            loss = (lam * fa * ce_a + (1 - lam) * fb * ce_b).mean()
+            cls_loss = (lam * fa * ce_a + (1 - lam) * fb * ce_b).mean()
         else:
-            loss = (lam * ce_a + (1 - lam) * ce_b).mean()
+            cls_loss = (lam * ce_a + (1 - lam) * ce_b).mean()
 
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True)
-        return loss
+        total_loss = cls_loss + domain_loss
+        self.log('train_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True)
+        if target_images is not None:
+            self.log('domain_loss', domain_loss, on_step=True, on_epoch=True, prog_bar=True)
+        return total_loss
 
     def validation_step(self, batch, batch_idx):
         images, labels = batch
