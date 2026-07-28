@@ -23,3 +23,5 @@ tensorboard==2.14.0
 jupyter==1.0.0
 ipython
 pandas
+optuna
+optuna-integration

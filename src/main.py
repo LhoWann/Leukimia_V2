@@ -7,9 +7,16 @@ warnings.filterwarnings("ignore", message="triton not found.*")
 warnings.filterwarnings("ignore", category=UserWarning, module="torch.nn.functional")
 warnings.filterwarnings("ignore", message=".*LeafSpec.*is deprecated.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", message=".*Precision bf16-mixed is not supported.*")
 
 logging.getLogger("torch.utils.flop_counter").setLevel(logging.ERROR)
 logging.getLogger("lightning.pytorch.utilities._pytree").setLevel(logging.ERROR)
+logging.getLogger("lightning.pytorch.utilities.model_summary").setLevel(logging.ERROR)
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+
+import os
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["HF_HUB_DISABLE_WARNINGS"] = "1"
 
 import argparse
 import random
@@ -369,7 +376,7 @@ def run_dual_pipeline(
 
         _release_gpu()
 
-        print(f"\n[Evaluation] Running evaluation for seed {seed}...")
+        print(f"\n[Evaluation] Running evaluation for seed {seed}")
         subprocess.run([
             sys.executable, "src/evaluate.py", 
             "--exp", "source_only", "uda_pseudolabel", 

@@ -2,10 +2,22 @@ import argparse
 import os
 import sys
 from pathlib import Path
+import warnings
+import logging
+
+warnings.filterwarnings("ignore", message="triton not found.*")
+warnings.filterwarnings("ignore", message=".*LeafSpec.*is deprecated.*")
+warnings.filterwarnings("ignore", message=".*Precision bf16-mixed is not supported.*")
+logging.getLogger("torch.utils.flop_counter").setLevel(logging.ERROR)
+logging.getLogger("lightning.pytorch.utilities._pytree").setLevel(logging.ERROR)
+logging.getLogger("lightning.pytorch.utilities.model_summary").setLevel(logging.ERROR)
+logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
+os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
+os.environ["HF_HUB_DISABLE_WARNINGS"] = "1"
 
 import optuna
 import lightning as L
-from optuna.integration import PyTorchLightningPruningCallback
+from optuna_integration.pytorch_lightning import PyTorchLightningPruningCallback
 from data_module import LeukemiaDataModule
 from lightning_model import LeukemiaLightningModel
 
