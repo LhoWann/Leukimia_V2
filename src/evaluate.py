@@ -109,8 +109,8 @@ def run_inference(
         for images, labels, names in loader:
             images = images.to(device)
             logits = model(images)
-            probs = F.softmax(logits, dim=1)[:, 0]
-            preds = 1 - logits.argmax(dim=1)
+            probs = F.softmax(logits, dim=1)[:, 1]   # P(Abnormal), class index 1
+            preds = logits.argmax(dim=1)
 
             all_preds.extend(preds.cpu().numpy().tolist())
             all_probs.extend(probs.cpu().numpy().tolist())
@@ -362,9 +362,9 @@ def compare_experiments(results: List[Dict]) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='UDA Leukemia Evaluation on Test Set')
+    parser = argparse.ArgumentParser(description='MS-DAST Leukemia Evaluation on Test Set')
     parser.add_argument('--exp', type=str, nargs='+',
-                        default=['source_only', 'uda_pseudolabel'],
+                        default=['source_only', 'ms_dast'],
                         help='Experiment name(s) to evaluate')
     parser.add_argument('--test-dir', type=str, default='dataset/test')
     parser.add_argument('--ckpt-root', type=str, default='checkpoints')

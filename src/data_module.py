@@ -8,11 +8,18 @@ import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
-from skimage.segmentation import slic
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from torchvision import datasets, transforms
 
 import lightning as L
+
+class TargetDS(Dataset):
+    def __init__(self, samples, transform):
+        self.samples = samples
+        self.transform = transform
+    def __len__(self): return len(self.samples)
+    def __getitem__(self, idx):
+        return self.transform(Image.open(self.samples[idx][0]).convert('RGB'))
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
@@ -53,10 +60,8 @@ def focus_aug_mix(
     if image_b_np.shape[:2] != (h, w):
         image_b_np = cv2.resize(image_b_np, (w, h), interpolation=cv2.INTER_LINEAR)
 
-    segments = slic(
-        image_a_np, n_segments=n_segments, compactness=compactness,
-        start_label=0, channel_axis=2,
-    )
+    grid_size = max(1, int(np.sqrt(n_segments)))
+    grid_h, grid_w = h // grid_size, w // grid_size
 
     if use_saliency:
         score_map = compute_saliency_map(image_b_np)
@@ -71,18 +76,30 @@ def focus_aug_mix(
         else:
             score_map = gradcam_map.astype(np.float32)
 
-    seg_ids = np.unique(segments)
-    seg_scores = np.array([score_map[segments == s].mean() for s in seg_ids])
+    seg_scores = []
+    seg_coords = []
+    for i in range(grid_size):
+        for j in range(grid_size):
+            y1, x1 = i * grid_h, j * grid_w
+            y2 = (i + 1) * grid_h if i < grid_size - 1 else h
+            x2 = (j + 1) * grid_w if j < grid_size - 1 else w
+            patch_score = score_map[y1:y2, x1:x2].mean()
+            seg_scores.append(patch_score)
+            seg_coords.append((y1, y2, x1, x2))
+
     order = np.argsort(seg_scores)[::-1]
+    num_paste = max(1, int(len(seg_scores) * paste_ratio))
 
-    num_paste = max(1, int(len(seg_ids) * paste_ratio))
-    paste_ids = seg_ids[order[:num_paste]]
-
-    paste_mask = np.isin(segments, paste_ids)
     mixed = image_a_np.copy()
-    mixed[paste_mask] = image_b_np[paste_mask]
+    total_area = h * w
+    pasted_area = 0
 
-    lam = 1.0 - paste_mask.mean()
+    for idx in order[:num_paste]:
+        y1, y2, x1, x2 = seg_coords[idx]
+        mixed[y1:y2, x1:x2] = image_b_np[y1:y2, x1:x2]
+        pasted_area += (y2 - y1) * (x2 - x1)
+
+    lam = 1.0 - (pasted_area / total_area)
     return mixed, float(lam)
 
 
@@ -160,6 +177,8 @@ class FocusAugMixDataset(Dataset):
         return len(self.samples)
 
     def _sample_partner(self, idx: int) -> int:
+        if len(self.samples) <= 1:
+            return idx
         partner = random.randint(0, len(self.samples) - 1)
         while partner == idx:
             partner = random.randint(0, len(self.samples) - 1)
@@ -258,7 +277,7 @@ class LeukemiaDataModule(L.LightningDataModule):
         stain_aug_prob: float = 0.5,
         use_dataset_weighted_sampling: bool = False,
         manifest_csv: str = '',
-        uda_mode: bool = False,
+        ms_dast_mode: bool = False,
     ):
         super().__init__()
         self.data_dir         = data_dir
@@ -322,7 +341,7 @@ class LeukemiaDataModule(L.LightningDataModule):
         self.classes = None
         self.num_classes = None
 
-        self.uda_mode = uda_mode
+        self.ms_dast_mode = ms_dast_mode
         self.target_samples = []
         self.source_samples = []
         self.pseudo_labels = {}
@@ -412,6 +431,9 @@ class LeukemiaDataModule(L.LightningDataModule):
 
     def train_dataloader(self):
         n_workers = 0 if self.aug_mode == 'focusmix_cam' else self.num_workers
+        
+        bs = self.batch_size // 2 if self.ms_dast_mode else self.batch_size
+        bs = max(2, bs)
 
         if self._dataset_sample_weights is not None:
             sampler = WeightedRandomSampler(
@@ -421,7 +443,7 @@ class LeukemiaDataModule(L.LightningDataModule):
             )
             source_loader = DataLoader(
                 self.train_dataset,
-                batch_size=self.batch_size,
+                batch_size=bs,
                 sampler=sampler,
                 num_workers=n_workers,
                 collate_fn=focusaugmix_collate_fn,
@@ -431,7 +453,7 @@ class LeukemiaDataModule(L.LightningDataModule):
         else:
             source_loader = DataLoader(
                 self.train_dataset,
-                batch_size=self.batch_size,
+                batch_size=bs,
                 shuffle=True,
                 num_workers=n_workers,
                 collate_fn=focusaugmix_collate_fn,
@@ -439,18 +461,10 @@ class LeukemiaDataModule(L.LightningDataModule):
                 persistent_workers=(n_workers > 0),
             )
 
-        if self.uda_mode and len(self.target_samples) > 0:
-            class _TargetDS(Dataset):
-                def __init__(self_, samples, transform):
-                    self_.samples = samples
-                    self_.transform = transform
-                def __len__(self_): return len(self_.samples)
-                def __getitem__(self_, idx):
-                    return self_.transform(Image.open(self_.samples[idx][0]).convert('RGB'))
-
+        if self.ms_dast_mode and len(self.target_samples) > 0:
             target_loader = DataLoader(
-                _TargetDS(self.target_samples, self.train_transform),
-                batch_size=self.batch_size,
+                TargetDS(self.target_samples, self.train_transform),
+                batch_size=bs,
                 shuffle=True,
                 num_workers=n_workers,
                 pin_memory=False,

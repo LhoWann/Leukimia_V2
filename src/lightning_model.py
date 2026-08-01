@@ -179,7 +179,12 @@ def build_param_groups(
 ):
     groups = []
 
-    head_params = list(model.classifier.parameters()) + list(model.head_dropout.parameters())
+    head_params = (
+        list(model.classifier.parameters())
+        + list(model.head_dropout.parameters())
+        # domain_classifier must be in optimizer — otherwise DANN discriminator never learns
+        + list(model.domain_classifier.parameters())
+    )
     if model.use_mha:
         head_params += list(model.mha.parameters()) + list(model.mha_norm.parameters())
     groups.append({'params': head_params, 'lr': base_lr, 'weight_decay': weight_decay})
@@ -213,7 +218,8 @@ class LeukemiaLightningModel(L.LightningModule):
         class_weights: Optional[List[float]] = None,
         use_focal_loss: bool = True,
         focal_gamma: float = 3.0,
-        uda_mode: bool = False,
+        ms_dast_mode: bool = False,
+        domain_loss_weight: float = 0.3,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -244,18 +250,24 @@ class LeukemiaLightningModel(L.LightningModule):
     MIN_SOURCE_F1_FOR_PSEUDOLABEL = 0.70
 
     def on_train_epoch_start(self):
-        if not self.hparams.uda_mode:
+        if not self.hparams.ms_dast_mode:
             return
 
+        is_main = (self.global_rank == 0)
+
         if self.current_epoch < self.BURNIN_EPOCHS:
-            print(f"[UDA] Epoch {self.current_epoch}: burn-in ({self.current_epoch}/{self.BURNIN_EPOCHS}), skipping pseudo-label.")
+            if is_main:
+                print(f"[MS-DAST] Epoch {self.current_epoch}: burn-in "
+                      f"({self.current_epoch}/{self.BURNIN_EPOCHS}), skipping pseudo-label.")
             return
 
         source_f1 = self.trainer.callback_metrics.get('val_f1', torch.tensor(0.0))
         if isinstance(source_f1, torch.Tensor):
             source_f1 = source_f1.item()
         if source_f1 < self.MIN_SOURCE_F1_FOR_PSEUDOLABEL:
-            print(f"[UDA] Epoch {self.current_epoch}: val_f1={source_f1:.4f} < {self.MIN_SOURCE_F1_FOR_PSEUDOLABEL}, skipping pseudo-label.")
+            if is_main:
+                print(f"[MS-DAST] Epoch {self.current_epoch}: val_f1={source_f1:.4f} "
+                      f"< {self.MIN_SOURCE_F1_FOR_PSEUDOLABEL}, skipping pseudo-label.")
             return
 
         dm = self.trainer.datamodule
@@ -270,9 +282,10 @@ class LeukemiaLightningModel(L.LightningModule):
         else:
             conf_threshold = 0.85
 
-        print(f"\n[UDA] Epoch {epoch}: Generating pseudo-labels "
-              f"(threshold={conf_threshold}, source_f1={source_f1:.4f}, "
-              f"{len(dm.target_samples)} target samples)...")
+        if is_main:
+            print(f"\n[MS-DAST] Epoch {epoch}: Generating pseudo-labels "
+                  f"(threshold={conf_threshold}, source_f1={source_f1:.4f}, "
+                  f"{len(dm.target_samples)} target samples)...")
         self.model.eval()
         all_candidates: List[tuple] = []
 
@@ -317,8 +330,9 @@ class LeukemiaLightningModel(L.LightningModule):
         if class_buckets:
             if len(class_buckets) < 2:
                 only_cls = list(class_buckets.keys())[0]
-                print(f"[UDA] WARNING: All pseudo-labels are class {only_cls} only. "
-                      f"Skipping injection to prevent bias reinforcement.")
+                if is_main:
+                    print(f"[MS-DAST] WARNING: All pseudo-labels are class {only_cls} only. "
+                          f"Skipping injection to prevent bias reinforcement.")
                 self.model.train()
                 dm.update_pseudo_labels({})
                 return
@@ -331,10 +345,13 @@ class LeukemiaLightningModel(L.LightningModule):
             max_allowed = 0
 
         self.model.train()
-        print(f"[UDA] Kept {len(pseudo_labels)}/{len(dm.target_samples)} pseudo-labels "
-              f"({len(all_candidates)} passed threshold, balanced cap={max_allowed}).")
+        if is_main:
+            print(f"[MS-DAST] Kept {len(pseudo_labels)}/{len(dm.target_samples)} pseudo-labels "
+                  f"({len(all_candidates)} passed threshold, balanced cap={max_allowed}).")
 
         dm.update_pseudo_labels(pseudo_labels)
+        # Sync all DDP ranks after dataset update before training resumes
+        self.trainer.strategy.barrier()
 
     def forward(self, x, return_domain=False):
         if return_domain:
@@ -359,6 +376,14 @@ class LeukemiaLightningModel(L.LightningModule):
             B_s = images.size(0)
             B_t = target_images.size(0)
             combined_images = torch.cat([images, target_images], dim=0)
+
+            # Gradual GRL alpha: 0 -> 1 via sigmoid schedule over training
+            p = min(1.0, self.current_epoch / max(1, self.hparams.max_epochs))
+            grl_alpha = float(2.0 / (1.0 + np.exp(-10.0 * p)) - 1.0)
+            for m in self.model.domain_classifier.modules():
+                if isinstance(m, GradientReversalLayer):
+                    m.alpha = grl_alpha
+
             cls_logits, domain_logits = self(combined_images, return_domain=True)
             
             src_cls_logits = cls_logits[:B_s]
@@ -386,7 +411,7 @@ class LeukemiaLightningModel(L.LightningModule):
         else:
             cls_loss = (lam * ce_a + (1 - lam) * ce_b).mean()
 
-        total_loss = cls_loss + domain_loss
+        total_loss = cls_loss + (self.hparams.domain_loss_weight * domain_loss)
         self.log('train_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True)
         if target_images is not None:
             self.log('domain_loss', domain_loss, on_step=True, on_epoch=True, prog_bar=True)

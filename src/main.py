@@ -1,6 +1,7 @@
 import warnings
 import logging
 import gc
+import sys
 from typing import Optional
 
 warnings.filterwarnings("ignore", message="triton not found.*")
@@ -40,18 +41,12 @@ except Exception:
 
 import lightning as L
 from lightning.pytorch.callbacks import (
-    ModelCheckpoint, EarlyStopping, LearningRateMonitor,
+    ModelCheckpoint, EarlyStopping, LearningRateMonitor, TQDMProgressBar,
 )
 from lightning.pytorch.loggers import CSVLogger
 
 from data_module import LeukemiaDataModule
 from lightning_model import LeukemiaLightningModel, GradCAMExtractor
-
-try:
-    from lightning.pytorch.callbacks import RichProgressBar
-    _RICH = True
-except ImportError:
-    _RICH = False
 
 
 @dataclass
@@ -59,7 +54,7 @@ class ExperimentConfig:
     name: str
     aug_mode: str
     use_mha: bool
-    uda_mode: bool = False
+    ms_dast_mode: bool = False
     mha_stage: int = 2
     aug_prob: float = 0.5
     paste_ratio: float = 0.25
@@ -67,67 +62,74 @@ class ExperimentConfig:
     lr: float = 1e-4
     weight_decay: float = 0.05
     llrd: float = 0.75
-    label_smoothing: float = 0.0
-    batch_size: int = 32
+    label_smoothing: float = 0.05
+    batch_size: int = 16
     max_epochs: int = 100
-    warmup_epochs: int = 5
+    warmup_epochs: int = 10
     use_robust_aug: bool = True
     stain_sigma_mean: float = 0.15
     stain_sigma_std: float = 0.10
     stain_aug_prob: float = 0.5
     use_focal_loss: bool = True
-    focal_gamma: float = 2.0
+    focal_gamma: float = 3.5
     use_dataset_weighted_sampling: bool = True
+    domain_loss_weight: float = 0.3
 
 
 EXPERIMENTS = {
     'source_only': ExperimentConfig(
         name='source_only',
         aug_mode='focusmix',
-        use_mha=False,
-        uda_mode=False,
+        use_mha=True,
+        ms_dast_mode=False,
         paste_ratio=0.25,
         n_segments=50,
         use_robust_aug=True,
         stain_sigma_mean=0.15,
         stain_sigma_std=0.10,
         stain_aug_prob=0.5,
-        focal_gamma=3.0,
+        # NOTE: lr/weight_decay/llrd from previous Optuna were tuned on Nano+source_only.
+        # Re-run: python src/tune.py --n-trials 50 to get correct values for Tiny.
+        lr=1.9e-05,
+        weight_decay=0.01,
+        llrd=0.82,
+        focal_gamma=3.5,
+        label_smoothing=0.05,
         max_epochs=100,
-        warmup_epochs=5,
-        batch_size=32,
+        warmup_epochs=10,
+        batch_size=16,
         use_dataset_weighted_sampling=True,
+        domain_loss_weight=0.3,
     ),
-    'uda_pseudolabel': ExperimentConfig(
-        name='uda_pseudolabel',
+    'ms_dast': ExperimentConfig(
+        name='ms_dast',
         aug_mode='focusmix',
-        use_mha=False,
-        uda_mode=True,
+        use_mha=True,
+        ms_dast_mode=True,
         paste_ratio=0.25,
         n_segments=50,
         use_robust_aug=True,
         stain_sigma_mean=0.15,
         stain_sigma_std=0.10,
         stain_aug_prob=0.5,
-        focal_gamma=3.0,
+        # NOTE: Re-run: python src/tune.py --n-trials 50 --ms-dast to get correct values.
+        lr=1.9e-05,
+        weight_decay=0.01,
+        llrd=0.82,
+        focal_gamma=3.5,
+        label_smoothing=0.05,
         max_epochs=100,
-        warmup_epochs=5,
-        batch_size=32,
+        warmup_epochs=10,
+        batch_size=16,
         use_dataset_weighted_sampling=True,
+        domain_loss_weight=0.3,
     ),
 }
 
 
 class GradCAMRefresher(L.Callback):
-    """Refresh GradCAM saliency maps every N epochs using batched inference.
-
-    Batched version: processes cfg.batch_size images per forward+backward pass
-    instead of one at a time — eliminates the per-image Python loop bottleneck
-    that was the dominant CPU cost on the previous implementation.
-    """
-
     def __init__(self, refresh_every: int = 5, target_stage: int = 3,
-                 batch_size: int = 32):
+                 batch_size: int = 16):
         super().__init__()
         self.refresh_every = refresh_every
         self.target_stage = target_stage
@@ -229,7 +231,7 @@ def run_experiment(
         stain_sigma_std=cfg.stain_sigma_std,
         stain_aug_prob=cfg.stain_aug_prob,
         use_dataset_weighted_sampling=cfg.use_dataset_weighted_sampling,
-        uda_mode=cfg.uda_mode,
+        ms_dast_mode=cfg.ms_dast_mode,
     )
     datamodule.setup()
 
@@ -237,13 +239,13 @@ def run_experiment(
 
     print(f"\n{'=' * 60}")
     print(f"Experiment : {run_name}")
-    print(f"UDA mode   : {cfg.uda_mode}")
+    print(f"MS-DAST mode: {cfg.ms_dast_mode}")
     print(f"Seed       : {seed}")
     print(f"Config     : {asdict(cfg)}")
     print(f"Classes    : {datamodule.classes}")
     print(f"Train      : {len(datamodule.train_dataset)} | Val: {len(datamodule.val_dataset)}")
     print(f"Class weights: {[f'{w:.3f}' for w in class_weights]}")
-    if cfg.uda_mode:
+    if cfg.ms_dast_mode:
         print(f"Target (unlabeled): {len(datamodule.target_samples)} images")
     if source_ckpt:
         print(f"Source checkpoint : {source_ckpt}")
@@ -263,7 +265,8 @@ def run_experiment(
         class_weights=class_weights,
         use_focal_loss=cfg.use_focal_loss,
         focal_gamma=cfg.focal_gamma,
-        uda_mode=cfg.uda_mode,
+        ms_dast_mode=cfg.ms_dast_mode,
+        domain_loss_weight=cfg.domain_loss_weight,
     )
 
     if source_ckpt:
@@ -305,21 +308,21 @@ def run_experiment(
             target_stage=3,
             batch_size=cfg.batch_size,
         ))
-    if _RICH:
-        callbacks.append(RichProgressBar())
+    if not any(isinstance(c, TQDMProgressBar) for c in callbacks):
+        callbacks.append(TQDMProgressBar())
 
     trainer = L.Trainer(
         max_epochs=cfg.max_epochs,
         accelerator='auto',
         devices='auto',
-        precision='bf16-mixed',
+        precision='16-mixed',
         callbacks=callbacks,
         logger=CSVLogger(log_root, name=run_name),
         gradient_clip_val=1.0,
         log_every_n_steps=10,
         deterministic=False,
-        accumulate_grad_batches=accumulate_grad,
-        reload_dataloaders_every_n_epochs=1 if cfg.uda_mode else 0,
+        accumulate_grad_batches=accumulate_grad * 2 if cfg.ms_dast_mode else accumulate_grad,
+        reload_dataloaders_every_n_epochs=1 if cfg.ms_dast_mode else 0,
     )
 
     trainer.fit(model, datamodule=datamodule)
@@ -340,12 +343,6 @@ def run_dual_pipeline(
     num_workers: int,
     accumulate_grad: int,
 ):
-    """Two-stage pipeline: source_only then uda_pseudolabel with weight transfer.
-
-    Stage 1 trains on labeled source data only. The best checkpoint is then used
-    to initialize Stage 2, so pseudo-label generation starts from a trained model
-    rather than random weights. GPU memory is cleared between stages.
-    """
     for seed in seeds:
         print(f"\n{'#' * 60}")
         print(f"# Dual Pipeline  —  Seed {seed}")
@@ -364,7 +361,7 @@ def run_dual_pipeline(
         _release_gpu()
 
         run_experiment(
-            EXPERIMENTS['uda_pseudolabel'],
+            EXPERIMENTS['ms_dast'],
             data_dir=data_dir,
             seed=seed,
             ckpt_root=ckpt_root,
@@ -377,16 +374,33 @@ def run_dual_pipeline(
         _release_gpu()
 
         print(f"\n[Evaluation] Running evaluation for seed {seed}")
-        subprocess.run([
-            sys.executable, "src/evaluate.py", 
-            "--exp", "source_only", "uda_pseudolabel", 
-            "--seed", str(seed)
-        ], check=True)
+        # Import evaluate directly — avoids subprocess CWD/PATH issues in notebooks
+        import importlib, os
+        import torch as _torch
+        _eval_spec = importlib.util.spec_from_file_location(
+            "evaluate", os.path.join(os.path.dirname(__file__), "evaluate.py")
+        )
+        _eval_mod = importlib.util.module_from_spec(_eval_spec)
+        _eval_spec.loader.exec_module(_eval_mod)
+
+        _device = _torch.device('cuda' if _torch.cuda.is_available() else 'cpu')
+        _manifest = os.path.join(data_dir, 'metadata', 'dataset_manifest.csv')
+        for _exp in ['source_only', 'ms_dast']:
+            _eval_mod.evaluate_experiment(
+                exp_name=_exp,
+                test_dir=os.path.join(data_dir, 'test'),
+                ckpt_root=ckpt_root,
+                manifest_path=_manifest,
+                results_dir='results',
+                device=_device,
+                batch_size=32,
+                seed=seed,
+            )
         print(f"[Evaluation] Done for seed {seed}.\n")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='UDA Leukemia Training')
+    parser = argparse.ArgumentParser(description='MS-DAST Leukemia Training')
     parser.add_argument('--exp', type=str, default='source_only',
                         choices=list(EXPERIMENTS.keys()))
     parser.add_argument('--data-dir', type=str, default='dataset')
@@ -395,14 +409,14 @@ def main():
     parser.add_argument('--all', action='store_true',
                         help='Run all experiments sequentially')
     parser.add_argument('--dual', action='store_true',
-                        help='Run source_only then uda_pseudolabel with checkpoint handoff')
+                        help='Run source_only then ms_dast with checkpoint handoff')
     parser.add_argument('--ckpt-root', type=str, default='checkpoints',
                         help='Root directory for checkpoints')
     parser.add_argument('--log-root', type=str, default='logs',
                         help='Root directory for CSV logs')
     parser.add_argument('--num-workers', type=int, default=2,
                         help='DataLoader worker processes')
-    parser.add_argument('--accumulate-grad', type=int, default=1,
+    parser.add_argument('--accumulate-grad', type=int, default=2,
                         help='Gradient accumulation steps (e.g. 2 = effective batch x2)')
     args = parser.parse_args()
 
