@@ -462,16 +462,20 @@ class LeukemiaDataModule(L.LightningDataModule):
             )
 
         if self.ms_dast_mode and len(self.target_samples) > 0:
+            # Cap target workers: each DDP rank already runs n_workers for source;
+            # adding n_workers for target doubles CPU usage per process.
+            target_workers = min(n_workers, 2)
             target_loader = DataLoader(
                 TargetDS(self.target_samples, self.train_transform),
                 batch_size=bs,
                 shuffle=True,
-                num_workers=n_workers,
+                num_workers=target_workers,
                 pin_memory=False,
-                persistent_workers=(n_workers > 0)
+                persistent_workers=(target_workers > 0),
             )
             from lightning.pytorch.utilities.combined_loader import CombinedLoader
             return CombinedLoader({"source": source_loader, "target": target_loader}, mode="max_size_cycle")
+
 
         return source_loader
 

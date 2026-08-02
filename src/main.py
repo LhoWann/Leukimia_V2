@@ -18,6 +18,7 @@ logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 import os
 os.environ["HF_HUB_DISABLE_SYMLINKS_WARNING"] = "1"
 os.environ["HF_HUB_DISABLE_WARNINGS"] = "1"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import argparse
 import random
@@ -204,6 +205,32 @@ def _release_gpu():
         torch.cuda.synchronize()
 
 
+def _get_devices():
+    """Return usable GPU count (or 'cpu'). Handles holes: skip GPUs that fail
+    a small CUDA op (e.g. one T4 not yet allocated in a 2xT4 session)."""
+    if not torch.cuda.is_available():
+        return 'cpu'
+    n = torch.cuda.device_count()
+    if n == 0:
+        return 'cpu'
+    good = []
+    for i in range(n):
+        try:
+            t = torch.tensor([1.0], device=f'cuda:{i}')
+            _ = t + t  # force actual kernel launch
+            del t
+            good.append(i)
+        except Exception:
+            print(f"[GPU] Skipping cuda:{i} — not usable.")
+    if not good:
+        return 'cpu'
+    # Lightning expects either int (count from 0) or list of specific IDs.
+    # Use list when there are holes; use int when contiguous from 0.
+    if good == list(range(len(good))):
+        return len(good)
+    return good
+
+
 def run_experiment(
     cfg: ExperimentConfig,
     data_dir: str = 'dataset',
@@ -311,17 +338,31 @@ def run_experiment(
     if not any(isinstance(c, TQDMProgressBar) for c in callbacks):
         callbacks.append(TQDMProgressBar())
 
+    _devices = _get_devices()
+    _n_gpus = _devices if isinstance(_devices, int) else (len(_devices) if isinstance(_devices, list) else 0)
+    _accelerator = 'gpu' if _n_gpus > 0 else 'cpu'
+    _strategy = 'ddp_find_unused_parameters_false' if _n_gpus > 1 else 'auto'
+
+    # accumulate_grad already accounts for effective batch size.
+    # On 2xT4 DDP, each GPU processes batch_size samples and gradients are
+    # averaged — effective batch = batch_size * n_gpus.  Do NOT double again
+    # for ms_dast_mode; the old *2 caused quadrupling on 2xT4.
     trainer = L.Trainer(
         max_epochs=cfg.max_epochs,
-        accelerator='auto',
-        devices='auto',
+        accelerator=_accelerator,
+        devices=_devices,
+        strategy=_strategy,
         precision='16-mixed',
+        # DDP: do NOT auto-wrap samplers — CombinedLoader + WeightedRandomSampler
+        # conflict with Lightning's DistributedSampler injection. Both GPUs will
+        # process the full dataset; gradients are averaged → equivalent to 2x compute.
+        use_distributed_sampler=False,
         callbacks=callbacks,
         logger=CSVLogger(log_root, name=run_name),
         gradient_clip_val=1.0,
         log_every_n_steps=10,
         deterministic=False,
-        accumulate_grad_batches=accumulate_grad * 2 if cfg.ms_dast_mode else accumulate_grad,
+        accumulate_grad_batches=accumulate_grad,
         reload_dataloaders_every_n_epochs=1 if cfg.ms_dast_mode else 0,
     )
 

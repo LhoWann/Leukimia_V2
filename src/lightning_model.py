@@ -350,8 +350,10 @@ class LeukemiaLightningModel(L.LightningModule):
                   f"({len(all_candidates)} passed threshold, balanced cap={max_allowed}).")
 
         dm.update_pseudo_labels(pseudo_labels)
-        # Sync all DDP ranks after dataset update before training resumes
-        self.trainer.strategy.barrier()
+        # Sync all DDP ranks after dataset update before training resumes.
+        # Guard: barrier() only valid in multi-rank (DDP) context.
+        if self.trainer.world_size > 1:
+            self.trainer.strategy.barrier()
 
     def forward(self, x, return_domain=False):
         if return_domain:
@@ -435,9 +437,9 @@ class LeukemiaLightningModel(L.LightningModule):
         self.val_prec(preds, labels)
         self.val_rec(preds, labels)
 
-        self.log('val_loss', loss, on_epoch=True, prog_bar=True)
+        self.log('val_loss', loss, on_epoch=True, prog_bar=True, sync_dist=True)
         self.log('val_acc', self.val_acc, on_epoch=True, prog_bar=True)
-        self.log('val_f1', self.val_f1, on_epoch=True)
+        self.log('val_f1', self.val_f1, on_epoch=True, prog_bar=True)  # monitored by EarlyStopping + ModelCheckpoint
         self.log('val_precision', self.val_prec, on_epoch=True)
         self.log('val_recall', self.val_rec, on_epoch=True)
         return loss
