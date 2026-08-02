@@ -89,16 +89,16 @@ EXPERIMENTS = {
         stain_sigma_mean=0.15,
         stain_sigma_std=0.10,
         stain_aug_prob=0.5,
-        # NOTE: lr/weight_decay/llrd from previous Optuna were tuned on Nano+source_only.
-        # Re-run: python src/tune.py --n-trials 50 to get correct values for Tiny.
-        lr=1.9e-05,
-        weight_decay=0.01,
-        llrd=0.82,
-        focal_gamma=3.5,
-        label_smoothing=0.05,
+        # Optuna best: Trial 12, val_f1=0.7985 (source_only, 34 trials, ConvNeXtV2-Tiny)
+        # warmup_epochs scaled 7->10 for 100-epoch training
+        lr=2.055e-05,
+        weight_decay=0.01888,
+        llrd=0.7707,
+        focal_gamma=3.139,
+        label_smoothing=0.0933,
         max_epochs=100,
         warmup_epochs=10,
-        batch_size=16,
+        batch_size=64,
         use_dataset_weighted_sampling=True,
         domain_loss_weight=0.3,
     ),
@@ -113,7 +113,6 @@ EXPERIMENTS = {
         stain_sigma_mean=0.15,
         stain_sigma_std=0.10,
         stain_aug_prob=0.5,
-        # NOTE: Re-run: python src/tune.py --n-trials 50 --ms-dast to get correct values.
         lr=1.9e-05,
         weight_decay=0.01,
         llrd=0.82,
@@ -206,8 +205,6 @@ def _release_gpu():
 
 
 def _get_devices():
-    """Return usable GPU count (or 'cpu'). Handles holes: skip GPUs that fail
-    a small CUDA op (e.g. one T4 not yet allocated in a 2xT4 session)."""
     if not torch.cuda.is_available():
         return 'cpu'
     n = torch.cuda.device_count()
@@ -224,8 +221,6 @@ def _get_devices():
             print(f"[GPU] Skipping cuda:{i} — not usable.")
     if not good:
         return 'cpu'
-    # Lightning expects either int (count from 0) or list of specific IDs.
-    # Use list when there are holes; use int when contiguous from 0.
     if good == list(range(len(good))):
         return len(good)
     return good
@@ -455,10 +450,10 @@ def main():
                         help='Root directory for checkpoints')
     parser.add_argument('--log-root', type=str, default='logs',
                         help='Root directory for CSV logs')
-    parser.add_argument('--num-workers', type=int, default=2,
+    parser.add_argument('--num-workers', type=int, default=4,
                         help='DataLoader worker processes')
-    parser.add_argument('--accumulate-grad', type=int, default=2,
-                        help='Gradient accumulation steps (e.g. 2 = effective batch x2)')
+    parser.add_argument('--accumulate-grad', type=int, default=1,
+                        help='Gradient accumulation steps (default: 1)')
     args = parser.parse_args()
 
     if args.dual:
