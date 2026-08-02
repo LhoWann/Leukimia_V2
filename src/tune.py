@@ -53,8 +53,8 @@ def objective(trial, ms_dast_mode=False):
 
     datamodule = LeukemiaDataModule(
         data_dir="dataset",
-        batch_size=16,
-        num_workers=2,
+        batch_size=64,
+        num_workers=4,
         aug_mode='focusmix',
         use_robust_aug=True,
         use_dataset_weighted_sampling=True,
@@ -83,10 +83,13 @@ def objective(trial, ms_dast_mode=False):
     trainer = L.Trainer(
         max_epochs=TUNE_EPOCHS,
         accelerator='auto',
-        devices='auto',
+        devices=1,
         precision='16-mixed',
         logger=False,
         enable_checkpointing=False,
+        enable_progress_bar=False,
+        num_sanity_val_steps=0,
+        reload_dataloaders_every_n_epochs=1 if ms_dast_mode else 0,
         callbacks=[PyTorchLightningPruningCallback(trial, monitor="val_f1")],
         gradient_clip_val=1.0,
     )
