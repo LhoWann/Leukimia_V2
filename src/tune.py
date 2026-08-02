@@ -106,19 +106,30 @@ def objective(trial, ms_dast_mode=False):
 
 
 def run_study(n_trials, ms_dast_mode, timeout_sec):
+    import time
     pruner = optuna.pruners.HyperbandPruner(min_resource=3, max_resource=TUNE_EPOCHS, reduction_factor=3)
     mode_name = "ms_dast" if ms_dast_mode else "source"
     study_name = f"leukemia_{mode_name}_tiny"
     db_name    = f"optuna_{mode_name}_tiny.db"
 
-    study = optuna.create_study(
-        study_name=study_name,
-        storage=f"sqlite:///{db_name}",
-        load_if_exists=True,
-        direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=42),
-        pruner=pruner,
-    )
+    study = None
+    for _attempt in range(5):
+        try:
+            study = optuna.create_study(
+                study_name=study_name,
+                storage=f"sqlite:///{db_name}?timeout=30",
+                load_if_exists=True,
+                direction="maximize",
+                sampler=optuna.samplers.TPESampler(seed=42),
+                pruner=pruner,
+            )
+            break
+        except Exception as e:
+            print(f"[run_study] create_study attempt {_attempt + 1}/5 failed: {e}. Retrying in 2s...")
+            time.sleep(2)
+    if study is None:
+        raise RuntimeError(f"Failed to create/load Optuna study after 5 attempts: {db_name}")
+
     print(f"\n--- Starting tuning for {mode_name.upper()} on ConvNeXtV2-Tiny (n_trials={n_trials}, epochs={TUNE_EPOCHS}) ---")
     study.optimize(
         lambda trial: objective(trial, ms_dast_mode=ms_dast_mode),
