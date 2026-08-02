@@ -9,10 +9,15 @@ warnings.filterwarnings("ignore", category=UserWarning, module="torch.nn.functio
 warnings.filterwarnings("ignore", message=".*LeafSpec.*is deprecated.*")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", message=".*Precision bf16-mixed is not supported.*")
+warnings.filterwarnings("ignore", message=".*Grad strides do not match bucket view strides.*")
+warnings.filterwarnings("ignore", message=".*batch_size.*ambiguous collection.*")
+warnings.filterwarnings("ignore", message=".*pin_memory.*persistent_workers.*")
+warnings.filterwarnings("ignore", message=".*find_unused_parameters.*")
 
 logging.getLogger("torch.utils.flop_counter").setLevel(logging.ERROR)
 logging.getLogger("lightning.pytorch.utilities._pytree").setLevel(logging.ERROR)
 logging.getLogger("lightning.pytorch.utilities.model_summary").setLevel(logging.ERROR)
+logging.getLogger("lightning.pytorch.utilities.rank_zero").setLevel(logging.ERROR)
 logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
 import os
@@ -29,6 +34,7 @@ import numpy as np
 import torch
 
 torch.set_float32_matmul_precision('medium')
+torch.autograd.graph.set_warn_on_accumulate_grad_stream_mismatch(False)
 
 try:
     import numpy._core.multiarray
