@@ -89,7 +89,6 @@ def objective(trial, ms_dast_mode=False):
         enable_checkpointing=False,
         enable_progress_bar=False,
         num_sanity_val_steps=0,
-        reload_dataloaders_every_n_epochs=1 if ms_dast_mode else 0,
         callbacks=[PyTorchLightningPruningCallback(trial, monitor="val_f1")],
         gradient_clip_val=1.0,
     )
