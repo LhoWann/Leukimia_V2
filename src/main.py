@@ -336,7 +336,7 @@ def run_experiment(
     _devices = _get_devices()
     _n_gpus = _devices if isinstance(_devices, int) else (len(_devices) if isinstance(_devices, list) else 0)
     _accelerator = 'gpu' if _n_gpus > 0 else 'cpu'
-    _strategy = 'ddp_find_unused_parameters_false' if _n_gpus > 1 else 'auto'
+    _strategy = 'ddp_find_unused_parameters_true' if _n_gpus > 1 else 'auto'
 
     # accumulate_grad already accounts for effective batch size.
     # On 2xT4 DDP, each GPU processes batch_size samples and gradients are
