@@ -327,7 +327,7 @@ def run_experiment(
             save_last=True,
             save_weights_only=True,
         ),
-        EarlyStopping(monitor='val_f1', mode='max', patience=15, verbose=True),
+        EarlyStopping(monitor='val_f1', mode='max', patience=30, verbose=False),
         LearningRateMonitor(logging_interval='epoch'),
     ]
     if cfg.aug_mode == 'focusmix_cam':
@@ -367,7 +367,14 @@ def run_experiment(
         reload_dataloaders_every_n_epochs=1 if cfg.ms_dast_mode else 0,
     )
 
-    trainer.fit(model, datamodule=datamodule)
+    last_ckpt = ckpt_dir / 'last.ckpt'
+    resume_path = str(last_ckpt) if last_ckpt.exists() else None
+    if resume_path:
+        print(f"\n[Resume] Found checkpoint: {resume_path}")
+    else:
+        print(f"\n[Resume] No checkpoint found, starting from scratch.")
+
+    trainer.fit(model, datamodule=datamodule, ckpt_path=resume_path)
 
     best_path = callbacks[0].best_model_path
     print(f"\nBest checkpoint: {best_path}")
